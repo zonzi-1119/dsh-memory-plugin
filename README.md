@@ -143,6 +143,10 @@ python tests/test_memory.py
 - BM25 对中文短语和关键词效果稳定；语义近似查询不如向量模型
 - 需要更强语义时，可以在 `/search` 前加一层 embedding 召回，再交给 BM25 混排
 
+## 故障排查
+
+卡巴斯基等杀毒软件可能把本地 HTTP + SQLite 的 Python 服务误报为恶意软件，处理方式见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)。
+
 ## License
 
 MIT
