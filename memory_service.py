@@ -24,6 +24,11 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 import jieba
 
+try:
+    from backfill import run_backfill
+except Exception:
+    run_backfill = None
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.environ.get("MEMORY_DB") or os.path.join(ROOT, "memory.db")
 PORT = int(os.environ.get("MEMORY_PORT") or 3210)
@@ -188,6 +193,14 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 self._json(200, add_memory(body.get("text"), body.get("chat", ""), body.get("sender", ""), body.get("kind", "message"), body.get("importance", 1)))
             return
+        if self.path.startswith("/backfill"):
+            if not run_backfill:
+                self._json(500, {"ok": False, "error": "backfill module not found"})
+                return
+            with LOCK:
+                result = run_backfill(add_memory)
+            self._json(200, {"ok": True, **result})
+            return
         if self.path.startswith("/search"):
             self._json(200, {"ok": True, "results": search_memory(body.get("query", ""), body.get("k", 6), body.get("chat"))})
             return
@@ -197,6 +210,13 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     init_db()
     print(f"memory service on 127.0.0.1:{PORT} db={DB_FILE}", flush=True)
+    if run_backfill and os.environ.get("AUTO_BACKFILL", "1") != "0":
+        def _auto():
+            try:
+                print("auto backfill:", run_backfill(add_memory), flush=True)
+            except Exception as e:
+                print("auto backfill failed:", e, flush=True)
+        threading.Thread(target=_auto, daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
 
 
