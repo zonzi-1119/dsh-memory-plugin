@@ -94,6 +94,36 @@ const hits = (await res.json()).results;
 
 把 `hits` 拼成一段【长期记忆检索】注入提示词，并注明“这些是更早的片段，不是这一轮发生的事”。
 
+## 自动回填历史
+
+服务默认在启动时自动回填一次历史聊天，来源：
+
+- `SOCIAL_STATE`：QQ 桥接的 `state/social-v2.json`，读取 `recentMessages`
+- `ARCHIVE_DIR`：`D:\QQ桥接文档\上下文交接` 下的归档 `.md`，解析「完整对话」段落
+
+```bash
+# 默认开启；设为 0 可关闭
+AUTO_BACKFILL=0 python memory_service.py
+
+# 自定义来源
+SOCIAL_STATE=/path/to/social-v2.json
+ARCHIVE_DIR=/path/to/archives
+```
+
+也可以手动触发：
+
+```http
+POST /backfill
+```
+
+返回：
+
+```json
+{"ok": true, "social": 228, "archives": 721, "total": 949}
+```
+
+重复内容由 `hash` 自动去重，多次回填不会重复入库。
+
 ## 测试
 
 ```bash
