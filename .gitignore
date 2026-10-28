@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+memory.db
+memory.db-*
+*.log
+.env
+.venv/
