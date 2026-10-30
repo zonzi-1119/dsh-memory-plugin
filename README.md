@@ -1,17 +1,22 @@
-# DSH 长期记忆插件
+# DSH 分层长期记忆插件
 
-给 DeepSeek Harness / QQ 桥接里的角色加一个本地长期记忆服务。
+给 DeepSeek Harness / QQ 桥接里的角色加一个本地、分层、可睡眠巩固的长期记忆服务。
 
-不依赖云端 embedding，不下载模型，CPU 占用低：
+不依赖云端 embedding，不下载大模型，CPU 占用低：
 
 - SQLite 存记忆
 - jieba 中文分词
 - BM25 + 时间衰减 + 重要度检索
+- 快层便签 → 睡眠巩固成抽屉 → 做梦复习
 - HTTP 接口，任何桥接都能接
 
 ## 为什么需要
 
-聊天上下文只有最近几十/上百条，几个月前的约定、关系、偏好会被挤掉。这个服务把每条对话持久化，唤醒时只把**最相关的几条旧记忆**注入提示词，从而突破上下文窗口。
+聊天上下文只有最近几十/上百条，几个月前的约定、关系、偏好会被挤掉。这个服务把每条对话持久化，并分成快慢两层：
+
+- **快便签**：白天新内容先记这里
+- **抽屉**：睡一觉后整理进慢层，旧抽屉锁住不再改
+- 新对话直接检索全部抽屉，能翻出很久之前的记忆
 
 ## 启动
 
@@ -29,22 +34,42 @@ MEMORY_PORT=3210
 MEMORY_DB=/path/to/memory.db
 ```
 
-## API
+## 分层模型
 
-### 健康检查
-
-```http
-GET /health
+```
+新消息
+  ↓
+快便签 fast_notes
+  ↓ 每天 03:00，便签 ≥20 条
+睡眠：新建 drawer，旧 drawer 全部 locked
+  ↓
+慢层 memories（drawer_id 标记归属）
+  ↓
+做梦：自出复习题，练一遍再测
+  ↓
+好梦（分数上涨）记录到 dreams
 ```
 
-### 写入记忆
+对应思路：海马体快层 → 睡眠巩固到新皮层抽屉 → SEAL 式自生成复习材料。
 
-```http
+## API
+
+| 方法 | 路径 | 作用 |
+|---|---|---|
+| GET | `/health` | 总条数、便签数 |
+| GET | `/layers` | 快层、慢层、抽屉、梦 |
+| GET | `/drawers` | 抽屉索引（也写 `drawers.json`） |
+| POST | `/add` | 写入一条记忆（慢层 + 快便签） |
+| POST | `/search` | 检索抽屉和慢层，不检索未睡便签 |
+| POST | `/sleep` | 睡眠巩固：新建抽屉、锁旧抽屉、清空便签 |
+| POST | `/dream` | 做梦复习：自出题、练习、测验、记录好梦 |
+
+### 写入
+
+```json
 POST /add
-Content-Type: application/json
-
 {
-  "text": "老爹喜欢叫我大肥鱼",
+  "text": "老爹答应带鱼去看海",
   "chat": "private:3439292605",
   "sender": "老爹",
   "kind": "message",
@@ -52,26 +77,45 @@ Content-Type: application/json
 }
 ```
 
-`importance` 越高，检索时权重越大；长期事实建议 3。
+`importance` 越高检索权重越大；长期事实建议 3。
 
 ### 检索
 
-```http
+```json
 POST /search
-Content-Type: application/json
-
-{
-  "query": "老爹喜欢叫我什么",
-  "chat": "private:3439292605",
-  "k": 6
-}
+{"query": "看海", "chat": "private:3439292605", "k": 6}
 ```
 
-返回按相关度排序的记忆片段。
+返回结果会带 `layer` 和 `drawer_id`，方便区分来源。
+
+### 睡眠与做梦
+
+```http
+POST /sleep
+POST /dream
+```
+
+睡眠返回新抽屉 id、学习条数、纠错数、清空的便签数；做梦返回练习条数、前后分数、是否好梦。
+
+## 模拟
+
+`simulate_layers.py` 会用临时数据库跑 6 个旧抽屉 + 3 轮学习：
+
+```bash
+python simulate_layers.py
+```
+
+测试点：
+
+1. 新便签进入新抽屉
+2. 旧抽屉锁定，不被覆盖
+3. 睡眠后便签清空
+4. 能召回最早抽屉里的远期记忆
+5. 每轮做梦都有分数变化
 
 ## 接入桥接
 
-每次收到消息时：
+每条消息：
 
 ```js
 fetch('http://127.0.0.1:3210/add', {
@@ -81,7 +125,7 @@ fetch('http://127.0.0.1:3210/add', {
 });
 ```
 
-每次唤醒前，用最新一条消息检索：
+每次唤醒前检索：
 
 ```js
 const res = await fetch('http://127.0.0.1:3210/search', {
@@ -89,63 +133,22 @@ const res = await fetch('http://127.0.0.1:3210/search', {
   headers: { 'content-type': 'application/json' },
   body: JSON.stringify({ query: lastText, chat: key, k: 6 })
 });
-const hits = (await res.json()).results;
 ```
 
-把 `hits` 拼成一段【长期记忆检索】注入提示词，并注明“这些是更早的片段，不是这一轮发生的事”。
-
-## 自动回填历史
-
-服务默认在启动时自动回填一次历史聊天，来源：
-
-- `SOCIAL_STATE`：QQ 桥接的 `state/social-v2.json`，读取 `recentMessages`
-- `ARCHIVE_DIR`：`D:\QQ桥接文档\上下文交接` 下的归档 `.md`，解析「完整对话」段落
-
-```bash
-# 默认开启；设为 0 可关闭
-AUTO_BACKFILL=0 python memory_service.py
-
-# 自定义来源
-SOCIAL_STATE=/path/to/social-v2.json
-ARCHIVE_DIR=/path/to/archives
-```
-
-也可以手动触发：
-
-```http
-POST /backfill
-```
-
-返回：
-
-```json
-{"ok": true, "social": 228, "archives": 721, "total": 949}
-```
-
-重复内容由 `hash` 自动去重，多次回填不会重复入库。
+把结果拼成【长期记忆检索】注入提示词，并注明来源是便签还是抽屉。
 
 ## 测试
 
 ```bash
 python tests/test_memory.py
+python simulate_layers.py
 ```
-
-测试会：
-
-1. 启动一个临时数据库和端口
-2. 写入 40 条记忆，其中一条是很早以前的独特事实
-3. 用相关 query 检索，确认旧事实能排到前面
-4. 重启服务，再次检索，确认记忆持久化
 
 ## 设计取舍
 
 - 不引入 embedding 模型：部署简单、离线可用、无 GPU 依赖
 - BM25 对中文短语和关键词效果稳定；语义近似查询不如向量模型
-- 需要更强语义时，可以在 `/search` 前加一层 embedding 召回，再交给 BM25 混排
-
-## 故障排查
-
-卡巴斯基等杀毒软件可能把本地 HTTP + SQLite 的 Python 服务误报为恶意软件，处理方式见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)。
+- “睡眠/做梦”是工程模拟：抽屉是 SQLite 分区，教师/学生是问答与纠错流程，不是真的改模型参数
 
 ## License
 
