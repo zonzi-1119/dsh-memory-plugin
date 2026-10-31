@@ -97,6 +97,29 @@ POST /dream
 
 睡眠返回新抽屉 id、学习条数、纠错数、清空的便签数；做梦返回练习条数、前后分数、是否好梦。
 
+## 睡眠后自动开新一轮对话
+
+`/sleep` 真正完成巩固（有新便签、生成了抽屉）后，会调用 DSH 的 Web API：
+
+1. 按目录挂载工作区（`workspace.create`，幂等）；
+2. 新建会话并命名 `迭代 YYYY-MM-DD HH:MM`（`session.create` + `session.rename`）；
+3. 把上一轮自动创建的那个会话归档（`workspace.archiveSession`，从 GUI 列表移除，日志保留）。
+
+被 `skipped`（便签不足）时不触发；DSH 不可达或密钥读不到时只在日志记一行，不影响睡眠本身。
+上一轮会话 id 记在数据库同目录的 `last-iteration-session.json`，只归档自己创建的会话，不碰手动对话。
+
+| 环境变量 | 默认 | 作用 |
+|---|---|---|
+| `MEMORY_NEW_SESSION` | `1` | 置 0 关闭自动开新对话 |
+| `MEMORY_DELETE_OLD_SESSION` | `1` | 置 0 只建新对话、不归档上一轮 |
+| `MEMORY_DSH_BASE` | `http://127.0.0.1:52345` | DSH Web API 地址 |
+| `MEMORY_DSH_CWD` | 脚本上级目录 | 新会话所在工作区目录 |
+| `MEMORY_NEW_SESSION_PROMPT` | 空 | 新会话的开场消息 |
+
+鉴权用 `~/.dsh/.credentials.yaml` 里 `client-connection/browser-session` 的 32 字节密钥离线签
+会话 Cookie（HMAC-SHA256），不依赖启动 token，也不需要额外依赖。
+
+
 ## 模拟
 
 `simulate_layers.py` 会用临时数据库跑 6 个旧抽屉 + 3 轮学习：
