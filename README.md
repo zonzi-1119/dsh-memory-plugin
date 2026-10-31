@@ -2,6 +2,8 @@
 
 给 DeepSeek Harness / QQ 桥接里的角色加一个本地、分层、可睡眠巩固的长期记忆服务。
 
+> 这轮迭代从维吾尔语 20 轮/R21–R40 自学测试里吸收了客观判分、错题回炉、间隔复习、双向卡和闭卷新会话的做法，完整总结见 [REPORT.md](REPORT.md)。
+
 不依赖云端 embedding，不下载大模型，CPU 占用低：
 
 - SQLite 存记忆
@@ -62,7 +64,10 @@ MEMORY_DB=/path/to/memory.db
 | POST | `/add` | 写入一条记忆（慢层 + 快便签） |
 | POST | `/search` | 检索抽屉和慢层，不检索未睡便签 |
 | POST | `/sleep` | 睡眠巩固：新建抽屉、锁旧抽屉、清空便签 |
-| POST | `/dream` | 做梦复习：自出题、练习、测验、记录好梦 |
+| POST | `/dream` | 做梦复习：按到期卡数练习、测验、记录好梦 |
+| POST | `/review/next` | 取到期复习卡（只返回题干，不返回答案） |
+| POST | `/review/answer` | 提交作答，客观判分，更新间隔与错题池 |
+| POST | `/review/stats` | 复习卡总数、到期数、正确率、按抽屉统计 |
 
 ### 写入
 
