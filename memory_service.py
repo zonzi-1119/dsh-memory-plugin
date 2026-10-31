@@ -16,7 +16,9 @@ HTTP:
 """
 from __future__ import annotations
 
+import base64
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -26,6 +28,9 @@ import sqlite3
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -37,6 +42,136 @@ DB_FILE = os.environ.get("MEMORY_DB") or os.path.join(ROOT, "memory.db")
 PORT = int(os.environ.get("MEMORY_PORT") or 3210)
 LOCK = threading.Lock()
 STOP = set("的 了 是 我 你 他 她 它 们 在 有 和 就 都 也 不 吗 呢 啊 吧 呀 哦 这 那 个 一 会 要 说 去 来 很 还 被 把 给 对 上 下 中 里 好 没 人 什么 怎么 为什么 可以 一个 我们 你们 他们".split())
+
+# ── 睡眠后自动开一轮新对话（DSH GUI）────────────────────────────────────────
+# 每次 /sleep 真正完成巩固后，在 DSH 里新建一个会话，旧对话保持不动。
+DSH_BASE = (os.environ.get("MEMORY_DSH_BASE") or "http://127.0.0.1:52345").rstrip("/")
+DSH_CWD = os.environ.get("MEMORY_DSH_CWD") or os.path.dirname(ROOT)
+NEW_SESSION_ENABLED = os.environ.get("MEMORY_NEW_SESSION", "1").lower() not in {"0", "false", "off", "no"}
+NEW_SESSION_PROMPT = os.environ.get("MEMORY_NEW_SESSION_PROMPT", "")
+DELETE_OLD_SESSION = os.environ.get("MEMORY_DELETE_OLD_SESSION", "1").lower() not in {"0", "false", "off", "no"}
+
+
+def _b64u(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _dsh_cookie() -> str:
+    """用 ~/.dsh/.credentials.yaml 里的 browser-session 密钥离线签一个会话 Cookie。"""
+    path = os.path.join(os.path.expanduser("~"), ".dsh", ".credentials.yaml")
+    with open(path, encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    inside = False
+    secret = None
+    for line in lines:
+        if "client-connection/browser-session:" in line:
+            inside = True
+            continue
+        if inside:
+            m = re.match(r"^\s+secret:\s*(\S+)\s*$", line)
+            if m:
+                secret = m.group(1)
+                break
+            if line and not line.startswith(" "):
+                break
+    if not secret:
+        raise RuntimeError("credentials 里找不到 browser-session secret")
+    key = base64.urlsafe_b64decode(secret + "=" * (-len(secret) % 4))
+    authority = urllib.parse.urlparse(DSH_BASE).netloc
+    now = int(time.time() * 1000)
+    body = _b64u(json.dumps(
+        {"version": 1, "authority": authority, "issuedAt": now, "expiresAt": now + 3600_000},
+        separators=(",", ":"),
+    ).encode())
+    sig = _b64u(hmac.new(key, body.encode(), hashlib.sha256).digest())
+    name = "dsh-auth-" + _b64u(hashlib.sha256(authority.encode()).digest())
+    return f"{name}=v1.{body}.{sig}"
+
+
+def _dsh_rpc(method: str, payload: dict, cookie: str, timeout: int = 8):
+    endpoint = method.replace(".", "/")
+    body = dict(payload or {})
+    # 新版 session/prompt 强制要求 requestId
+    if endpoint == "session/prompt" and not body.get("requestId"):
+        body["requestId"] = uuid.uuid4().hex
+    message = {
+        "type": "client-request",
+        "rpcId": uuid.uuid4().hex,
+        "method": endpoint,
+        "payload": {"args": {"request": body}},
+    }
+    req = urllib.request.Request(
+        f"{DSH_BASE}/api/{endpoint}",
+        data=json.dumps(message).encode("utf-8"),
+        headers={"content-type": "application/json", "cookie": cookie},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        envelope = json.loads(resp.read().decode("utf-8"))
+    result = envelope.get("result") or {}
+    if not result.get("ok"):
+        raise RuntimeError(f"{method} 失败：{result.get('error')}")
+    return result.get("value")
+
+
+def _state_file() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(DB_FILE)) or ROOT, "last-iteration-session.json")
+
+
+def _read_prev_session():
+    try:
+        with open(_state_file(), encoding="utf-8") as f:
+            return (json.load(f) or {}).get("sessionId")
+    except Exception:
+        return None
+
+
+def _write_prev_session(session_id: str):
+    try:
+        os.makedirs(os.path.dirname(_state_file()), exist_ok=True)
+        with open(_state_file(), "w", encoding="utf-8") as f:
+            json.dump({"sessionId": session_id, "updatedAt": int(time.time())}, f)
+    except Exception:
+        pass
+
+
+def open_new_iteration_session() -> str:
+    """新建一个会话；上一轮自动建的会话会被归档（从 GUI 列表移除）。"""
+    cookie = _dsh_cookie()
+    prev = _read_prev_session()
+    ws = _dsh_rpc("workspace.create", {"path": DSH_CWD}, cookie)
+    workspace_id = ws["workspace"]["workspaceId"]
+    sid = _dsh_rpc("session.create", {"workspaceId": workspace_id}, cookie)["sessionId"]
+    title = "迭代 " + time.strftime("%Y-%m-%d %H:%M")
+    try:
+        _dsh_rpc("session.rename", {"sessionId": sid, "title": title}, cookie)
+    except Exception:
+        pass
+    if DELETE_OLD_SESSION and prev and prev != sid:
+        try:
+            _dsh_rpc("workspace.archiveSession", {"sessionId": prev}, cookie)
+            print(f"[sleep] 已归档上一轮对话 {prev}", flush=True)
+        except Exception as exc:
+            print(f"[sleep] 归档上一轮对话失败（{prev}）：{exc}", flush=True)
+    _write_prev_session(sid)
+    if NEW_SESSION_PROMPT:
+        try:
+            _dsh_rpc("session.prompt", {
+                "sessionId": sid,
+                "mode": "queue",
+                "content": [{"type": "text", "text": NEW_SESSION_PROMPT}],
+            }, cookie)
+        except Exception:
+            pass
+    return sid
+
+
+def _open_new_session_safely():
+    try:
+        sid = open_new_iteration_session()
+        print(f"[sleep] 已开启新一轮对话 {sid}", flush=True)
+    except Exception as exc:  # 新对话失败不能影响睡眠本身
+        print(f"[sleep] 开启新对话失败：{exc}", flush=True)
 
 
 def tokens_of(text: str):
@@ -334,7 +469,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/sleep"):
             with LOCK:
-                self._json(200, sleep_consolidate(body.get("minNotes", 1)))
+                outcome = sleep_consolidate(body.get("minNotes", 1))
+            self._json(200, outcome)
+            if outcome.get("ok") and not outcome.get("skipped") and NEW_SESSION_ENABLED:
+                threading.Thread(target=_open_new_session_safely, daemon=True).start()
             return
         if self.path.startswith("/dream"):
             with LOCK:
