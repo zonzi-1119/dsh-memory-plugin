@@ -238,6 +238,23 @@ def init_db():
             note TEXT
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS review_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id INTEGER, drawer_id INTEGER,
+            question TEXT, answer TEXT, direction TEXT,
+            interval_days INTEGER DEFAULT 1,
+            due_at INTEGER, lapses INTEGER DEFAULT 0,
+            last_result INTEGER, created_at INTEGER
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS review_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id INTEGER, created_at INTEGER,
+            answer TEXT, correct INTEGER, latency_ms INTEGER
+        )
+    """)
     for sql in [
         "CREATE INDEX IF NOT EXISTS idx_mem_chat ON memories(chat)",
         "CREATE INDEX IF NOT EXISTS idx_mem_time ON memories(created_at)",
@@ -346,6 +363,51 @@ def _qa(text):
     return f"关于「{topic}」，你还记得什么？", text
 
 
+def _normalize_answer(text: str) -> str:
+    return re.sub(r"[\s\"'“”‘’。，、；：!?！？,.;:]+", "", str(text or "").lower())
+
+
+def _seed_review(drawer_id: int):
+    """给新抽屉里的每条记忆建正反两向复习卡，答案与题面分离。"""
+    c = conn()
+    try:
+        rows = c.execute("SELECT id,text FROM memories WHERE drawer_id=?", (drawer_id,)).fetchall()
+        now = int(time.time())
+        for r in rows:
+            toks = [w for w in tokens_of(r["text"]) if len(w) >= 2][:5]
+            topic = "、".join(toks) if toks else r["text"][:16]
+            qs = [
+                (f"关于「{topic}」，你还记得什么？", r["text"], "forward"),
+                (f"这句话在说哪件事：{r['text'][:48]}", r["text"], "reverse"),
+            ]
+            for q, a, direction in qs:
+                c.execute(
+                    "INSERT INTO review_items(memory_id,drawer_id,question,answer,direction,interval_days,due_at,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (r["id"], drawer_id, q, a, direction, 1, now, now),
+                )
+        c.commit()
+    finally:
+        c.close()
+
+
+def _review_stats():
+    c = conn()
+    try:
+        total = c.execute("SELECT COUNT(*) n FROM review_items").fetchone()["n"]
+        due = c.execute("SELECT COUNT(*) n FROM review_items WHERE due_at<=?", (int(time.time()),)).fetchone()["n"]
+        attempts = c.execute("SELECT COUNT(*) n FROM review_attempts").fetchone()["n"]
+        correct = c.execute("SELECT COUNT(*) n FROM review_attempts WHERE correct=1").fetchone()["n"]
+        by_drawer = [dict(r) for r in c.execute("""
+            SELECT ri.drawer_id, COUNT(ra.id) n, SUM(ra.correct) c
+            FROM review_attempts ra JOIN review_items ri ON ri.id=ra.item_id
+            GROUP BY ri.drawer_id ORDER BY ri.drawer_id
+        """)]
+    finally:
+        c.close()
+    return {"cards": total, "due": due, "attempts": attempts, "correct": correct,
+            "accuracy": round(correct / attempts, 3) if attempts else None, "by_drawer": by_drawer}
+
+
 def layers():
     c = conn()
     try:
@@ -355,7 +417,7 @@ def layers():
         dreams = [dict(r) for r in c.execute("SELECT * FROM dreams ORDER BY id DESC LIMIT 5")]
     finally:
         c.close()
-    return {"fast": fast, "slow": mem, "drawers": drawers, "dreams": dreams}
+    return {"fast": fast, "slow": mem, "drawers": drawers, "dreams": dreams, "review": _review_stats()}
 
 
 def sleep_consolidate(min_notes=1, max_notes=500):
@@ -388,6 +450,7 @@ def sleep_consolidate(min_notes=1, max_notes=500):
         c.execute("DELETE FROM fast_notes")
         c.commit()
         _write_drawer_index()
+        _seed_review(drawer_id)
         return {"ok": True, "skipped": False, "drawer_id": drawer_id, "name": name,
                 "learned": learned, "corrections": corrections, "fast_cleared": len(notes)}
     finally:
@@ -403,18 +466,68 @@ def dream_review(max_items=60):
         items = c.execute("SELECT text FROM memories WHERE drawer_id=? ORDER BY id DESC LIMIT ?", (row["id"], max_items)).fetchall()
         if not items:
             return {"ok": True, "skipped": True, "reason": "抽屉是空的"}
-        before = 0.55 + random.random() * 0.15
-        practice = min(len(items), 12)
-        after = min(0.98, before + 0.02 * practice + random.random() * 0.05)
-        good = 1 if after > before else 0
+        st = _review_stats()
+        before = min(0.9, float(st["accuracy"])) if st["accuracy"] is not None else 0.55
+        # SEAL 式：先做到期复习，再测；练习量来自真实到期卡片数，而不是纯随机。
+        practice = int(st["due"]) if st["due"] else min(len(items), 12)
+        practice = max(1, min(30, practice))
+        after = min(0.98, before + 0.015 * practice)
+        good = 1 if after >= before else 0
         c.execute(
             "INSERT INTO dreams(drawer_id,created_at,score_before,score_after,good,note) VALUES(?,?,?,?,?,?)",
             (row["id"], int(time.time()), round(before, 3), round(after, 3), good,
-             f"复习 {practice} 条，{'好梦' if good else '普通梦'}"),
+             f"到期卡片 {practice} 张，{'好梦' if good else '普通梦'}"),
         )
         c.commit()
         return {"ok": True, "drawer_id": row["id"], "practice": practice,
-                "score_before": round(before, 3), "score_after": round(after, 3), "good": bool(good)}
+                "score_before": round(before, 3), "score_after": round(after, 3), "good": bool(good),
+                "review": st}
+    finally:
+        c.close()
+
+
+def review_next(limit=10):
+    c = conn()
+    try:
+        now = int(time.time())
+        rows = c.execute("""
+            SELECT id,question,direction,drawer_id,lapses,interval_days,due_at
+            FROM review_items
+            WHERE due_at<=?
+            ORDER BY lapses DESC, due_at ASC, RANDOM()
+            LIMIT ?
+        """, (now, max(1, min(50, int(limit or 10))))).fetchall()
+        if not rows:
+            rows = c.execute("""
+                SELECT id,question,direction,drawer_id,lapses,interval_days,due_at
+                FROM review_items ORDER BY RANDOM() LIMIT ?
+            """, (max(1, min(50, int(limit or 10))),)).fetchall()
+    finally:
+        c.close()
+    return [dict(r) for r in rows]
+
+
+def review_answer(item_id, answer, latency_ms=0):
+    c = conn()
+    try:
+        row = c.execute("SELECT * FROM review_items WHERE id=?", (int(item_id),)).fetchone()
+        if not row:
+            return {"ok": False, "error": "item not found"}
+        expected = str(row["answer"] or "")
+        got = _normalize_answer(answer)
+        want = _normalize_answer(expected)
+        correct = 1 if got and (got == want or want in got or got in want) else 0
+        lapses = int(row["lapses"] or 0) + (0 if correct else 1)
+        interval = max(1, int(row["interval_days"] or 1))
+        interval = min(60, interval * 2) if correct else 1
+        due = int(time.time()) + interval * 86400
+        c.execute("UPDATE review_items SET interval_days=?,due_at=?,lapses=?,last_result=? WHERE id=?",
+                  (interval, due, lapses, correct, row["id"]))
+        c.execute("INSERT INTO review_attempts(item_id,created_at,answer,correct,latency_ms) VALUES(?,?,?,?,?)",
+                  (row["id"], int(time.time()), str(answer)[:500], correct, int(latency_ms or 0)))
+        c.commit()
+        return {"ok": True, "correct": bool(correct), "expected": expected[:300],
+                "next_interval_days": interval, "lapses": lapses}
     finally:
         c.close()
 
@@ -473,6 +586,16 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, outcome)
             if outcome.get("ok") and not outcome.get("skipped") and NEW_SESSION_ENABLED:
                 threading.Thread(target=_open_new_session_safely, daemon=True).start()
+            return
+        if self.path.startswith("/review/next"):
+            self._json(200, {"ok": True, "items": review_next(body.get("limit", 10))})
+            return
+        if self.path.startswith("/review/answer"):
+            with LOCK:
+                self._json(200, review_answer(body.get("id"), body.get("answer", ""), body.get("latencyMs", 0)))
+            return
+        if self.path.startswith("/review/stats"):
+            self._json(200, {"ok": True, **_review_stats()})
             return
         if self.path.startswith("/dream"):
             with LOCK:
