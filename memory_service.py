@@ -432,7 +432,9 @@ def sleep_consolidate(min_notes=1, max_notes=500):
         drawer_id = cur.lastrowid
         learned = 0
         corrections = 0
+        processed_ids = []
         for n in notes:
+            processed_ids.append(n["id"])
             text = n["text"]
             _, a = _qa(text)
             student = a
@@ -447,7 +449,9 @@ def sleep_consolidate(min_notes=1, max_notes=500):
                 )
             learned += 1
         c.execute("UPDATE drawers SET item_count=? WHERE id=?", (learned, drawer_id))
-        c.execute("DELETE FROM fast_notes")
+        if processed_ids:
+            marks = ",".join("?" * len(processed_ids))
+            c.execute(f"DELETE FROM fast_notes WHERE id IN ({marks})", processed_ids)
         c.commit()
         _write_drawer_index()
         _seed_review(drawer_id)
