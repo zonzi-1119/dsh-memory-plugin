@@ -103,7 +103,14 @@ def _dsh_rpc(method: str, payload: dict, cookie: str, timeout: int = 8):
     req = urllib.request.Request(
         f"{DSH_BASE}/api/{endpoint}",
         data=json.dumps(message).encode("utf-8"),
-        headers={"content-type": "application/json", "cookie": cookie},
+        headers={
+            "content-type": "application/json",
+            "cookie": cookie,
+            **({"Acp-Session-Id": str(body.get("sessionId"))} if endpoint in {
+                "session/delete", "session/close", "session/cancel", "session/prompt",
+                "session/load", "session/resume", "session/fork", "session/set_mode",
+            } and body.get("sessionId") else {}),
+        },
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -591,7 +598,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/sleep"):
             with LOCK:
-                outcome = sleep_consolidate(body.get("minNotes", 1))
+                outcome = sleep_consolidate(body.get("minNotes", 1), body.get("maxNotes", 500))
             self._json(200, outcome)
             if outcome.get("ok") and not outcome.get("skipped") and NEW_SESSION_ENABLED:
                 threading.Thread(target=_open_new_session_safely, daemon=True).start()
