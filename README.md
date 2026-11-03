@@ -108,7 +108,7 @@ POST /dream
 
 1. 按目录挂载工作区（`workspace.create`，幂等）；
 2. 新建会话并命名 `迭代 YYYY-MM-DD HH:MM`（`session.create` + `session.rename`）；
-3. 把上一轮自动创建的那个会话归档（`workspace.archiveSession`，从 GUI 列表移除，日志保留）。
+3. 把上一轮自动创建的那个会话删除（`session.delete`；失败时回退为归档 `workspace.archiveSession`）。
 
 被 `skipped`（便签不足）时不触发；DSH 不可达或密钥读不到时只在日志记一行，不影响睡眠本身。
 上一轮会话 id 记在数据库同目录的 `last-iteration-session.json`，只归档自己创建的会话，不碰手动对话。
