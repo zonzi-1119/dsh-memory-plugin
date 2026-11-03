@@ -149,10 +149,15 @@ def open_new_iteration_session() -> str:
         pass
     if DELETE_OLD_SESSION and prev and prev != sid:
         try:
-            _dsh_rpc("workspace.archiveSession", {"sessionId": prev}, cookie)
-            print(f"[sleep] 已归档上一轮对话 {prev}", flush=True)
+            _dsh_rpc("session.delete", {"sessionId": prev}, cookie)
+            print(f"[sleep] 已删除上一轮对话 {prev}", flush=True)
         except Exception as exc:
-            print(f"[sleep] 归档上一轮对话失败（{prev}）：{exc}", flush=True)
+            print(f"[sleep] 删除上一轮对话失败（{prev}）：{exc}", flush=True)
+            try:
+                _dsh_rpc("workspace.archiveSession", {"sessionId": prev}, cookie)
+                print(f"[sleep] 已改为归档上一轮对话 {prev}", flush=True)
+            except Exception:
+                pass
     _write_prev_session(sid)
     if NEW_SESSION_PROMPT:
         try:
